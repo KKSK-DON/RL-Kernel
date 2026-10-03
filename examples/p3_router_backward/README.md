@@ -103,6 +103,13 @@ python -m unittest discover -s tests -p test_p3_router_backward_core.py -v
 CPU FP32 参考逐步执行运算，用于诊断；FP64 autograd 从原始分数独立求导，检查数学。
 另有能区分不同加法顺序的消去样例，防止误用通用 reduction。
 
+有限差分另外从原始 256 个 expert 分数构造 `L = sum(g * w)`，保持选择结果固定，
+逐个扰动原始分数，比较 `(L(s+h)-L(s-h))/(2h)` 与反向结果。重复 expert 的多个 slot
+会随同一个源分数一起变化。样例覆盖无重复、部分重复、六路同一 expert，以及
+`1e-20 / 1e-3 / 1 / 1e3` 四种分数尺度；`1e-20` 能观察 epsilon 的影响。
+CPU 数学检查使用两个相对步长；CUDA 输出也直接对照 FP64 前向有限差分。
+这类近似导数检查使用容差，不代替 FP32 逐位检查，也不跨 Top-K 选择边界求导。
+
 ### 已执行的验证：2026-10-02
 
 在 H100 80GB、PyTorch 2.9.1+cu128、nvcc 12.8.93 上编译运行：
@@ -113,7 +120,78 @@ CPU FP32 参考逐步执行运算，用于诊断；FP64 autograd 从原始分数
 
 完整输出、工具版本和源文件 SHA-256 保存在
 [`validation/h100-20261002.json`](validation/h100-20261002.json)。
-源码变更后应重新验证；这里没有性能结论或官方 P3 Gate 结论。
+源码变更后应重新验证；这份 10 月 2 日记录没有性能数据或官方 P3 Gate 结论。
+
+### 已执行的验证：2026-10-03
+
+同一 H100 / PyTorch 2.9.1+cu128 / nvcc 12.8.93 环境下，16 项测试全部通过、无跳过：
+13 项 CUDA 测试和 3 项 CPU 数学检查。新增两项分别检查公式与 CUDA 输出对前向有限差分
+的符合程度，覆盖上述 12 组尺度/ID 样例。日志与源码指纹见
+[`validation/h100-20261003.json`](validation/h100-20261003.json)。
+
+CUDA 源码、binding 和 Python 算术入口均未修改，仍与 10 月 2 日 Sanitizer 验证的
+SHA-256 相同；本次未重新运行 Sanitizer。选择路径无梯度的集成负向测试、正式 saved
+identity、T01 oracle 和训练框架验收仍待对接。
+
+## 独立性能基线
+
+在同一 CUDA 环境、仓库根目录运行：
+
+```bash
+python -m benchmarks.benchmark_p3_router_backward_core --json /tmp/t06-baseline.json
+```
+
+默认覆盖 `T=1,16,128,512,4096`，每个形状分别测试无重复和重复 expert，比较
+128/256 线程的同一 CUDA 核心及一个固定运算顺序的 PyTorch GPU 实现。
+每条路径在计时之外逐位对照 CPU 诊断参考，失败即停止。JSON 保存源码 SHA-256、
+运行环境、样例参数、全部计时样本、中位数和 p95。
+
+| 字段 | 测量内容 |
+| --- | --- |
+| `graph_device` | 将 32 次算术调用捕获成 CUDA Graph，用 CUDA events 测 replay 后除以 32；估计摊销后的 GPU 执行时间 |
+| `eager_wall` | 一次普通调用加完成同步的实际耗时，包含 CPU 调用开销；CUDA `_out` 复用输出，Torch 对照分配输出 |
+| `harness_wall` | 当前 Python 实验入口的实际耗时，包含输出分配、多次输入检查与同步 |
+
+Graph 反复使用同一组驻留输入，属于缓存已预热的微基准；CPU 分配和调用开销不在
+`graph_device` 内，但 GPU 清零、算术和写回都在。它不是单次 eager 请求延迟，也不表示
+正式同步 ABI 可以直接被 capture。p95 是样本的 nearest-rank 分位数；Graph 样本本身
+已经是每次 replay 的平均值，不代表单个 kernel 的尾延迟。
+
+Torch 对照用逐 slot 的 gather/add/scatter 保持重复 ID 的累加顺序，不使用浮点 atomic。
+它是局部算术的 eager 分解，不是 Megatron、Miles 或 Vime 原生 Router 的性能基线。
+不根据两者的比值宣称真实训练加速。
+
+可单独检查混合 padding 路径（无效行写入 NaN/非法 ID，检验屏蔽行为）：
+
+```bash
+python -m benchmarks.benchmark_p3_router_backward_core \
+  --tokens 1 33 --padding-fraction 0.5 --warmup 3 --samples 5 --graph-batch 8 \
+  --json /tmp/t06-padding-smoke.json
+```
+
+### H100 实测：2026-10-03
+
+两轮使用相同设置，第二轮加 `--threads 256 128` 反转配置顺序。以下为无重复 ID
+样例的中位数区间（单位均为微秒），区间表示两轮结果，不是置信区间：
+
+| T | 128 线程 Graph GPU | 256 线程 Graph GPU | 256 线程完整实验入口 |
+| --- | ---: | ---: | ---: |
+| 1 | 1.649–1.656 | 1.620–1.623 | 473.454–504.567 |
+| 16 | 1.711–1.712 | 1.677–1.678 | 474.598–492.019 |
+| 128 | 1.853–1.858 | 1.833–1.836 | 485.118–505.147 |
+| 512 | 1.933–1.941 | 1.930–1.954 | 490.697–510.537 |
+| 4096 | 3.967–3.975 | 4.678–4.694 | 522.030–536.444 |
+
+重复 ID 的结果相近。T=4096 时，128 线程的 Graph GPU 时间约低 15%；小 T 没有同样
+优势，因此保留默认 256 线程。CUDA `_out` 普通调用加同步约 10–14 微秒；完整入口
+约 0.47–0.54 毫秒。正式接入时应进一步分析值检查、分配和同步成本，不能将两个不同
+计时口径直接当作加速比，也不能直接删除合同要求的检查和同步。
+
+两轮各 30 个配置及另一次混合 padding smoke 均通过逐位对照；完整样本保存在
+[第一轮](validation/benchmark-h100-20261003-run1.json)、
+[反转顺序复测](validation/benchmark-h100-20261003-run2.json)、
+[padding smoke](validation/benchmark-h100-20261003-padding.json)。
+这些是合成数据的局部基线，不是模型级收益或官方验收结论。
 
 ## 下一步接入边界
 

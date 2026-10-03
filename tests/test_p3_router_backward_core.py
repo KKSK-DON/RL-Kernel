@@ -36,7 +36,58 @@ def cuda_case(case):
     return tuple(t.cuda() for t in case)
 
 
+@torch.no_grad()
+def finite_difference_scores(scores, ids, g, relative_step):
+    """Differentiate the scalar forward loss numerically, with selection frozen.
+
+    Perturb the original expert score, not a gathered slot: repeated IDs must
+    change together. FP64 differences check real-valued calculus, not FP32 bits.
+    No backward formula or autograd is used to construct this expectation.
+    """
+
+    def loss(values):
+        selected = values[ids.long()]
+        weights = 1.5 * selected / (selected.sum() + 1e-20)
+        return (weights * g).sum()
+
+    result = torch.empty_like(scores)
+    for expert in range(scores.numel()):
+        step = float(scores[expert]) * relative_step
+        plus, minus = scores.clone(), scores.clone()
+        plus[expert] += step
+        minus[expert] -= step
+        result[expert] = (loss(plus) - loss(minus)) / (2 * step)
+    return result
+
+
+def finite_difference_cases():
+    # Epsilon is material at 1e-20. Other scales exercise ordinary and large
+    # scores. The all-equal ID case detects missing duplicate contributions.
+    for scale in (1e-20, 1e-3, 1.0, 1e3):
+        for slots in ([0, 31, 32, 127, 128, 255], [7, 7, 3, 255, 7, 3], [4] * 6):
+            scores = torch.linspace(0.5, 2.0, 256, dtype=torch.float64) * scale
+            ids = torch.tensor(slots, dtype=torch.int32)
+            g = torch.tensor([1, -2, 3, -4, 5, -6], dtype=torch.float64)
+            yield scale, scores, ids, g
+
+
 class ReferenceTests(unittest.TestCase):
+    def test_formula_against_finite_differences(self):
+        for scale, scores, ids, g in finite_difference_cases():
+            a = scores[ids.long()]
+            z = a.sum() + 1e-20
+            actual = diagnostic_reference(
+                g[None, :], ids[None, :], (a / z)[None, :], z[None], torch.tensor([True])
+            )[0]
+            for step in (1e-4, 3e-5):
+                with self.subTest(scale=scale, ids=ids.tolist(), step=step):
+                    expected = finite_difference_scores(scores, ids, g, step)
+                    # Normalize units so the tolerance works at every scale,
+                    # including near-zero derivatives for all-equal IDs.
+                    torch.testing.assert_close(
+                        actual * scale, expected * scale, rtol=2e-6, atol=2e-8
+                    )
+
     def test_formula_against_independent_autograd(self):
         # Differentiate the original scores, so repeated IDs share a source.
         for slots in ([0, 1, 2, 3, 4, 5], [7, 7, 3, 255, 7, 3], [4] * 6):
@@ -74,6 +125,20 @@ class CudaCoreTests(unittest.TestCase):
         self.assertTrue(
             torch.equal(actual.cpu().view(torch.int32), expected.cpu().view(torch.int32))
         )
+
+    def test_cuda_against_forward_finite_differences(self):
+        for scale, scores, ids, g in finite_difference_cases():
+            with self.subTest(scale=scale, ids=ids.tolist()):
+                # Build saved FP32 state from representable original scores.
+                scores32 = scores.float()
+                a = scores32[ids.long()][None, :]
+                z = fixed_tree6(a) + 1e-20
+                case = (g.float()[None, :], ids[None, :], a / z[:, None], z, torch.tensor([True]))
+                actual = route_backward_core(*cuda_case(case))[0].cpu().double()
+                expected = finite_difference_scores(scores32.double(), ids, g, 1e-4)
+                # This compares FP32 arithmetic with a numerical FP64 derivative;
+                # byte equality is separately checked against the FP32 reference.
+                torch.testing.assert_close(actual * scale, expected * scale, rtol=2e-5, atol=3e-7)
 
     def test_fp32_reference_multiple_sizes(self):
         for tokens in (1, 7, 33, 257, 1024):
